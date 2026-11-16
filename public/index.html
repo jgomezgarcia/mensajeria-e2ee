@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mensajeria E2EE</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161925;
+    --panel-alt: #1d2130;
+    --border: #2a2f3f;
+    --text: #e8e9ec;
+    --text-dim: #9aa0ad;
+    --accent: #5b8cff;
+    --accent-dim: #3a5bb0;
+    --bubble-in: #232838;
+    --bubble-out: #3a5bb0;
+    --danger: #ff6b6b;
+    --radius: 12px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  [hidden] { display: none !important; }
+
+  button {
+    cursor: pointer;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 10px 16px;
+    transition: opacity 0.15s ease;
+  }
+  button:hover { opacity: 0.85; }
+  button.primary { background: var(--accent); color: white; }
+  button.secondary { background: var(--panel-alt); color: var(--text); border: 1px solid var(--border); }
+  button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+
+  input {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel-alt);
+    color: var(--text);
+    font-size: 14px;
+  }
+  input:focus { outline: 2px solid var(--accent); }
+
+  label {
+    display: block;
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    margin-top: 14px;
+  }
+
+  /* ---------- Pantalla de autenticacion ---------- */
+
+  #auth-screen {
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+
+  .auth-card {
+    width: 100%;
+    max-width: 380px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+  }
+
+  .auth-card h1 {
+    font-size: 20px;
+    margin: 0 0 4px;
+  }
+  .auth-card .subtitle {
+    color: var(--text-dim);
+    font-size: 13px;
+    margin: 0 0 20px;
+  }
+
+  .auth-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 18px;
+  }
+  .auth-tabs button {
+    flex: 1;
+    background: var(--panel-alt);
+    color: var(--text-dim);
+  }
+  .auth-tabs button.active {
+    background: var(--accent);
+    color: white;
+  }
+
+  .auth-card form button[type="submit"] {
+    width: 100%;
+    margin-top: 20px;
+  }
+
+  .error-text {
+    color: var(--danger);
+    font-size: 13px;
+    margin-top: 10px;
+    min-height: 1em;
+  }
+
+  .hint {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 10px;
+    line-height: 1.5;
+  }
+
+  /* ---------- Pantalla principal de la app ---------- */
+
+  #app-screen {
+    display: flex;
+    height: 100vh;
+  }
+
+  .sidebar {
+    width: 280px;
+    min-width: 220px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar-header {
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .sidebar-header .me {
+    font-weight: 700;
+    font-size: 15px;
+  }
+  .sidebar-header .me-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .sidebar-actions {
+    display: flex;
+    gap: 8px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sidebar-actions button { flex: 1; font-size: 12px; padding: 8px; }
+
+  .contacts-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px 4px;
+  }
+  .contacts-header span {
+    font-size: 12px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .contacts-header button {
+    background: transparent;
+    color: var(--accent);
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+
+  #contact-list {
+    list-style: none;
+    margin: 0;
+    padding: 4px 8px;
+    overflow-y: auto;
+    flex: 1;
+  }
+  .contact-item {
+    padding: 12px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    margin-bottom: 2px;
+  }
+  .contact-item:hover { background: var(--panel-alt); }
+  .contact-item.active { background: var(--accent-dim); color: white; }
+  .contact-empty {
+    color: var(--text-dim);
+    font-size: 13px;
+    padding: 12px;
+  }
+
+  /* ---------- Panel de chat ---------- */
+
+  .chat-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+  }
+
+  #chat-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-dim);
+    font-size: 14px;
+    text-align: center;
+    padding: 20px;
+  }
+
+  #chat-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .chat-header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .chat-header .contact-name {
+    font-size: 16px;
+    font-weight: 700;
+  }
+  .chat-header .security-code {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: 0.03em;
+    word-break: break-all;
+  }
+  .chat-header .security-label {
+    color: var(--accent);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    margin-right: 6px;
+  }
+
+  #message-list {
+    list-style: none;
+    margin: 0;
+    padding: 20px;
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .message { display: flex; flex-direction: column; max-width: 70%; }
+  .message.outgoing { align-self: flex-end; align-items: flex-end; }
+  .message.incoming { align-self: flex-start; align-items: flex-start; }
+
+  .message-bubble {
+    padding: 10px 14px;
+    border-radius: 16px;
+    font-size: 14px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .message.outgoing .message-bubble { background: var(--bubble-out); color: white; border-bottom-right-radius: 4px; }
+  .message.incoming .message-bubble { background: var(--bubble-in); color: var(--text); border-bottom-left-radius: 4px; }
+
+  .message-time {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 3px;
+    padding: 0 4px;
+  }
+
+  #message-form {
+    display: flex;
+    gap: 10px;
+    padding: 14px 20px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #message-input { flex: 1; }
+  #message-form button { white-space: nowrap; }
+
+  /* ---------- Responsive (movil) ---------- */
+
+  @media (max-width: 720px) {
+    #app-screen { flex-direction: column; }
+    .sidebar {
+      width: 100%;
+      min-width: 0;
+      max-height: 40vh;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+    }
+    .message { max-width: 85%; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ======================= Pantalla de autenticacion ======================= -->
+<div id="auth-screen">
+  <div class="auth-card">
+    <h1>Mensajeria E2EE</h1>
+    <p class="subtitle">Cifrado de extremo a extremo. Tu clave privada nunca sale de este navegador.</p>
+
+    <div class="auth-tabs">
+      <button type="button" id="tab-register" class="active">Registrarse</button>
+      <button type="button" id="tab-import">Importar clave</button>
+    </div>
+
+    <form id="register-form">
+      <label for="register-username">Nombre de usuario</label>
+      <input id="register-username" type="text" placeholder="p.ej. ana" pattern="[a-zA-Z0-9_-]{3,24}" required />
+
+      <label for="register-invite">Codigo de invitacion</label>
+      <input id="register-invite" type="password" required />
+
+      <button type="submit" class="primary">Crear identidad y entrar</button>
+      <p class="error-text" id="register-error"></p>
+      <p class="hint">Se generara un par de claves ECDH (P-256) en tu navegador. La privada se queda aqui; la publica se envia al servidor junto a tu nombre de usuario.</p>
+    </form>
+
+    <form id="import-form" hidden>
+      <label for="import-file">Archivo de clave exportado (.json)</label>
+      <input id="import-file" type="file" accept="application/json" required />
+
+      <button type="submit" class="primary">Importar y entrar</button>
+      <p class="error-text" id="import-error"></p>
+      <p class="hint">Usa esto si ya tenias una cuenta y cambiaste de navegador o se borro la cache.</p>
+    </form>
+  </div>
+</div>
+
+<!-- ======================= Pantalla principal ======================= -->
+<div id="app-screen" hidden>
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div>
+        <div class="me-label">Conectado como</div>
+        <div class="me" id="my-username">—</div>
+      </div>
+    </div>
+
+    <div class="sidebar-actions">
+      <button type="button" id="export-key-btn" class="secondary">Exportar clave</button>
+      <button type="button" id="logout-btn" class="danger">Cerrar sesion</button>
+    </div>
+
+    <div class="contacts-header">
+      <span>Contactos</span>
+      <button type="button" id="refresh-contacts-btn">Actualizar</button>
+    </div>
+    <ul id="contact-list"></ul>
+  </aside>
+
+  <main class="chat-area">
+    <div id="chat-empty">Selecciona un contacto a la izquierda para empezar a chatear.</div>
+
+    <div id="chat-panel" hidden>
+      <div class="chat-header">
+        <div class="contact-name" id="chat-contact-name">—</div>
+        <div class="security-code">
+          <span class="security-label">Codigo de seguridad</span>
+          <span id="chat-security-code">—</span>
+        </div>
+      </div>
+
+      <ul id="message-list"></ul>
+
+      <form id="message-form">
+        <input id="message-input" type="text" placeholder="Escribe un mensaje..." autocomplete="off" />
+        <button type="submit" class="primary">Enviar</button>
+      </form>
+    </div>
+  </main>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
