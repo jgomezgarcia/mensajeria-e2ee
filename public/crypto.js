@@ -94,6 +94,40 @@ export async function decryptMessage(aesKey, ciphertextB64, ivB64) {
   return new TextDecoder().decode(plaintextBuffer);
 }
 
+// --- Clave simetrica de grupo (generada por el creador, nunca por el servidor)
+
+// Genera 32 bytes aleatorios que seran la clave AES-256 compartida del grupo.
+// Se generan como bytes "en claro" (no como CryptoKey no extraible) porque
+// hay que envolverlos (cifrarlos) para cada miembro antes de poder olvidarlos.
+export function generateRawGroupKeyBytes() {
+  return window.crypto.getRandomValues(new Uint8Array(32));
+}
+
+// Importa los bytes de la clave de grupo como CryptoKey AES-GCM no extraible,
+// lista para cifrar/descifrar mensajes de ese grupo.
+export async function importGroupKey(rawBytes) {
+  return window.crypto.subtle.importKey(
+    'raw',
+    rawBytes,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+// Envuelve (cifra) la clave de grupo para un miembro concreto usando la clave
+// AES derivada por ECDH entre el creador y ese miembro. El resultado es opaco
+// para el servidor: solo el miembro, con su clave privada, puede desenvolverla.
+export async function wrapGroupKeyForMember(pairwiseAesKey, rawGroupKeyBytes) {
+  return encryptMessage(pairwiseAesKey, bufferToBase64(rawGroupKeyBytes));
+}
+
+// Inversa de wrapGroupKeyForMember: recupera los bytes de la clave de grupo.
+export async function unwrapGroupKey(pairwiseAesKey, wrappedKey) {
+  const base64 = await decryptMessage(pairwiseAesKey, wrappedKey.ciphertext, wrappedKey.iv);
+  return new Uint8Array(base64ToBuffer(base64));
+}
+
 // --- Codigo de seguridad anti-MITM -----------------------------------------
 
 // Huella SHA-256 de ambas claves publicas, ordenadas alfabeticamente antes de

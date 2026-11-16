@@ -31,7 +31,7 @@ const DB_FILE = path.join(DATA_DIR, 'db.json');
 function loadDb() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(DB_FILE)) {
-    const empty = { users: {}, messages: [] };
+    const empty = { users: {}, messages: [], groups: {}, groupKeys: {}, groupMessages: [] };
     fs.writeFileSync(DB_FILE, JSON.stringify(empty, null, 2));
     return empty;
   }
@@ -40,10 +40,13 @@ function loadDb() {
     const parsed = JSON.parse(raw);
     if (!parsed.users) parsed.users = {};
     if (!parsed.messages) parsed.messages = [];
+    if (!parsed.groups) parsed.groups = {};
+    if (!parsed.groupKeys) parsed.groupKeys = {};
+    if (!parsed.groupMessages) parsed.groupMessages = [];
     return parsed;
   } catch (err) {
     console.error('No se pudo leer data/db.json, se crea una base nueva:', err.message);
-    const empty = { users: {}, messages: [] };
+    const empty = { users: {}, messages: [], groups: {}, groupKeys: {}, groupMessages: [] };
     fs.writeFileSync(DB_FILE, JSON.stringify(empty, null, 2));
     return empty;
   }
@@ -65,6 +68,17 @@ function findUser(username) {
 
 function isValidUsername(username) {
   return typeof username === 'string' && /^[a-zA-Z0-9_-]{3,24}$/.test(username);
+}
+
+function groupRoom(groupId) {
+  return `group:${groupId}`;
+}
+
+// Grupos a los que pertenece un usuario (los mas recientes primero).
+function groupsForUser(username) {
+  return Object.values(db.groups)
+    .filter((g) => g.members.includes(username))
+    .sort((a, b) => b.createdAt - a.createdAt);
 }
 
 function generateToken() {
@@ -119,7 +133,7 @@ function promptInviteCodeMasked(question) {
   });
 }
 
-function promptInviteCodePlain(question) {
+function promptPlain(question) {
   return new Promise((resolve) => {
     const readline = require('readline');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -140,13 +154,41 @@ async function resolveInviteCode() {
   const isInteractive = process.stdin.isTTY && process.stdout.isTTY;
   const value = isInteractive
     ? await promptInviteCodeMasked(question)
-    : await promptInviteCodePlain(question);
+    : await promptPlain(question);
 
   if (!value || !value.trim()) {
     console.error('La clave de invitacion no puede estar vacia. Reinicia el servidor e introduce una clave.');
     process.exit(1);
   }
   return value.trim();
+}
+
+function parseYesNo(answer, defaultValue) {
+  const trimmed = (answer || '').trim().toLowerCase();
+  if (!trimmed) return defaultValue;
+  if (['s', 'si', 'sí', 'y', 'yes'].includes(trimmed)) return true;
+  if (['n', 'no'].includes(trimmed)) return false;
+  return defaultValue;
+}
+
+// Pregunta si se deben conservar usuarios y conversaciones para la proxima
+// vez que se arranque el servidor. Si la respuesta es "no", data/db.json se
+// vacia automaticamente cuando el proceso se detenga (Ctrl+C / cierre del
+// tunel), para no dejar rastro de esa sesion.
+async function resolvePersistData() {
+  if (process.env.PERSIST_DATA) {
+    return parseYesNo(process.env.PERSIST_DATA, true);
+  }
+
+  const isInteractive = process.stdin.isTTY && process.stdout.isTTY;
+  if (!isInteractive) {
+    console.log('Sin terminal interactiva: se conservaran los datos entre reinicios (usa PERSIST_DATA=no para cambiarlo).');
+    return true;
+  }
+
+  const question = '¿Guardar usuarios y conversaciones para la proxima vez que arranques el servidor? (S/n): ';
+  const answer = await promptPlain(question);
+  return parseYesNo(answer, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +278,112 @@ app.get('/api/messages', authMiddleware, (req, res) => {
   res.json(history);
 });
 
+// ---------------------------------------------------------------------------
+// Grupos: el servidor solo almacena metadatos (nombre, miembros) y, por cada
+// miembro, su copia de la clave de grupo ENVUELTA (cifrada). Esa clave de
+// grupo se genera en el navegador del creador y se envuelve individualmente
+// para cada miembro usando la clave AES derivada por ECDH entre el creador y
+// ese miembro (la misma tecnica que ya se usa para los chats 1 a 1). El
+// servidor nunca ve la clave de grupo en claro, ni el contenido de los
+// mensajes.
+// ---------------------------------------------------------------------------
+
+app.post('/api/groups', authMiddleware, (req, res) => {
+  const { name, members, wrappedKeys } = req.body || {};
+  const me = req.username;
+
+  if (typeof name !== 'string' || !name.trim() || name.length > 60) {
+    return res.status(400).json({ error: 'Nombre de grupo invalido (1-60 caracteres)' });
+  }
+  if (!Array.isArray(members) || members.some((m) => !isValidUsername(m))) {
+    return res.status(400).json({ error: 'Lista de miembros invalida' });
+  }
+  const uniqueMembers = Array.from(new Set([me, ...members]));
+  if (uniqueMembers.length < 2) {
+    return res.status(400).json({ error: 'Un grupo necesita al menos otro miembro' });
+  }
+  for (const m of uniqueMembers) {
+    if (!findUser(m)) {
+      return res.status(400).json({ error: `El usuario "${m}" no existe` });
+    }
+  }
+  if (!wrappedKeys || typeof wrappedKeys !== 'object') {
+    return res.status(400).json({ error: 'Falta la clave de grupo envuelta' });
+  }
+  for (const m of uniqueMembers) {
+    const wk = wrappedKeys[m];
+    if (!wk || !wk.ciphertext || !wk.iv) {
+      return res.status(400).json({ error: `Falta la clave envuelta para "${m}"` });
+    }
+  }
+
+  const id = crypto.randomUUID();
+  const group = {
+    id,
+    name: name.trim(),
+    createdBy: me,
+    members: uniqueMembers,
+    createdAt: Date.now(),
+  };
+  db.groups[id] = group;
+  db.groupKeys[id] = {};
+  for (const m of uniqueMembers) {
+    db.groupKeys[id][m] = { ciphertext: wrappedKeys[m].ciphertext, iv: wrappedKeys[m].iv };
+  }
+  saveDb(db);
+
+  // Metemos en la sala de socket.io a todos los miembros que esten conectados
+  // ahora mismo, y avisamos a los que no son el creador para que refresquen
+  // su lista de grupos en tiempo real.
+  io.in(uniqueMembers).socketsJoin(groupRoom(id));
+  for (const m of uniqueMembers) {
+    if (m === me) continue;
+    io.to(m).emit('group-created', {
+      id: group.id,
+      name: group.name,
+      createdBy: group.createdBy,
+      members: group.members,
+      createdAt: group.createdAt,
+      wrappedKey: db.groupKeys[id][m],
+    });
+  }
+
+  res.json({
+    id: group.id,
+    name: group.name,
+    createdBy: group.createdBy,
+    members: group.members,
+    createdAt: group.createdAt,
+  });
+});
+
+// Lista de grupos del usuario autenticado, cada uno con SU copia (y solo la
+// suya) de la clave de grupo envuelta.
+app.get('/api/groups', authMiddleware, (req, res) => {
+  const me = req.username;
+  const list = groupsForUser(me).map((g) => ({
+    id: g.id,
+    name: g.name,
+    createdBy: g.createdBy,
+    members: g.members,
+    createdAt: g.createdAt,
+    wrappedKey: (db.groupKeys[g.id] || {})[me] || null,
+  }));
+  res.json(list);
+});
+
+// Historial cifrado de un grupo. El servidor solo comprueba pertenencia.
+app.get('/api/groups/:id/messages', authMiddleware, (req, res) => {
+  const group = db.groups[req.params.id];
+  if (!group || !group.members.includes(req.username)) {
+    return res.status(404).json({ error: 'Grupo no encontrado' });
+  }
+  const history = db.groupMessages
+    .filter((m) => m.groupId === group.id)
+    .sort((a, b) => a.timestamp - b.timestamp);
+  res.json(history);
+});
+
 const server = http.createServer(app);
 
 // ---------------------------------------------------------------------------
@@ -261,6 +409,39 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
   const me = socket.data.username;
   socket.join(me); // una "sala" por usuario para poder dirigirle mensajes
+  for (const group of groupsForUser(me)) {
+    socket.join(groupRoom(group.id));
+  }
+
+  socket.on('group-message', (payload, ack) => {
+    try {
+      const { groupId, ciphertext, iv } = payload || {};
+      const group = db.groups[groupId];
+      if (!group || !group.members.includes(me) || !ciphertext || !iv) {
+        if (typeof ack === 'function') ack({ ok: false, error: 'Payload invalido' });
+        return;
+      }
+
+      const message = {
+        id: crypto.randomUUID(),
+        groupId,
+        from: me,
+        ciphertext, // texto cifrado en base64 con la clave simetrica del grupo, opaco para el servidor
+        iv,
+        timestamp: Date.now(),
+      };
+
+      db.groupMessages.push(message);
+      saveDb(db);
+
+      io.to(groupRoom(groupId)).emit('group-message', message);
+
+      if (typeof ack === 'function') ack({ ok: true, message });
+    } catch (err) {
+      console.error('Error procesando mensaje de grupo:', err);
+      if (typeof ack === 'function') ack({ ok: false, error: 'Error interno' });
+    }
+  });
 
   socket.on('message', (payload, ack) => {
     try {
@@ -299,9 +480,10 @@ io.on('connection', (socket) => {
 // una segunda terminal ni acordarte del comando de cloudflared.
 // ---------------------------------------------------------------------------
 
+// Devuelve una funcion para detener el tunel, o null si no se lanzo ninguno.
 function maybeStartTunnel() {
   const wantsTunnel = process.argv.includes('--tunnel') || process.env.ENABLE_TUNNEL === '1';
-  if (!wantsTunnel) return;
+  if (!wantsTunnel) return null;
 
   console.log('\nIniciando Cloudflare Tunnel (cloudflared)...\n');
   const { spawn } = require('child_process');
@@ -320,17 +502,43 @@ function maybeStartTunnel() {
     try { tunnel.kill(); } catch (_) { /* ya estaba parado */ }
   };
   process.on('exit', stopTunnel);
-  process.on('SIGINT', () => { stopTunnel(); process.exit(0); });
-  process.on('SIGTERM', () => { stopTunnel(); process.exit(0); });
+  return stopTunnel;
+}
+
+// Vacia la base de datos local (usuarios, mensajes y grupos) para no dejar
+// rastro de esta sesion cuando el usuario elige no conservar los datos.
+function resetDb() {
+  db = { users: {}, messages: [], groups: {}, groupKeys: {}, groupMessages: [] };
+  saveDb(db);
 }
 
 async function main() {
   activeInviteCode = await resolveInviteCode();
+  const persistData = await resolvePersistData();
+
+  let stopTunnel = null;
+
+  // Un unico manejador para Ctrl+C / cierre del proceso: para el tunel si
+  // estaba activo y, si el usuario pidio no conservar los datos, vacia
+  // data/db.json antes de salir.
+  const handleShutdown = () => {
+    if (stopTunnel) stopTunnel();
+    if (!persistData) {
+      console.log('\nBorrando usuarios y conversaciones de esta sesion (se pidio no conservarlos)...');
+      resetDb();
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', handleShutdown);
+  process.on('SIGTERM', handleShutdown);
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`\nServidor de mensajeria E2EE escuchando en http://0.0.0.0:${PORT}`);
     console.log('Clave de invitacion activa para esta sesion (compartela solo con quien quieras invitar).');
-    maybeStartTunnel();
+    console.log(persistData
+      ? 'Los datos de esta sesion se conservaran para la proxima vez.'
+      : 'Los datos de esta sesion se borraran al cerrar el servidor (Ctrl+C).');
+    stopTunnel = maybeStartTunnel();
   });
 }
 

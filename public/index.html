@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <title>Mensajeria E2EE</title>
 <style>
   :root {
@@ -22,12 +22,13 @@
 
   * { box-sizing: border-box; }
 
-  body {
+  html, body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     background: var(--bg);
     color: var(--text);
     height: 100vh;
+    height: 100dvh;
     overflow: hidden;
   }
 
@@ -54,7 +55,7 @@
     border: 1px solid var(--border);
     background: var(--panel-alt);
     color: var(--text);
-    font-size: 14px;
+    font-size: 16px; /* >=16px evita el zoom automatico al enfocar en iOS */
   }
   input:focus { outline: 2px solid var(--accent); }
 
@@ -134,6 +135,7 @@
   #app-screen {
     display: flex;
     height: 100vh;
+    height: 100dvh;
   }
 
   .sidebar {
@@ -243,6 +245,19 @@
     padding: 14px 20px;
     border-bottom: 1px solid var(--border);
     background: var(--panel);
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .chat-header-info { flex: 1; min-width: 0; }
+  #chat-back-btn {
+    display: none;
+    background: transparent;
+    color: var(--text);
+    padding: 6px 10px;
+    font-size: 18px;
+    line-height: 1;
+    flex-shrink: 0;
   }
   .chat-header .contact-name {
     font-size: 16px;
@@ -263,6 +278,11 @@
     font-size: 10px;
     letter-spacing: 0.08em;
     margin-right: 6px;
+  }
+  .chat-header .group-members {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-dim);
   }
 
   #message-list {
@@ -298,6 +318,14 @@
     padding: 0 4px;
   }
 
+  .message-sender {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 2px;
+    padding: 0 4px;
+  }
+
   #message-form {
     display: flex;
     gap: 10px;
@@ -308,17 +336,91 @@
   #message-input { flex: 1; }
   #message-form button { white-space: nowrap; }
 
-  /* ---------- Responsive (movil) ---------- */
+  /* ---------- Modal: crear grupo ---------- */
+
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    z-index: 50;
+  }
+  .modal-card {
+    width: 100%;
+    max-width: 420px;
+    max-height: 85vh;
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+  }
+  .modal-card h2 { margin: 0 0 4px; font-size: 18px; }
+  .modal-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 20px;
+  }
+  .modal-actions button { flex: 1; }
+
+  .checkbox-list {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 0;
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .checkbox-list li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  .checkbox-list li:last-child { border-bottom: none; }
+  .checkbox-list input[type="checkbox"] { width: auto; flex-shrink: 0; }
+  .checkbox-list .checkbox-empty { color: var(--text-dim); }
+
+  .group-badge {
+    display: inline-block;
+    margin-right: 6px;
+    opacity: 0.8;
+  }
+
+  /* ---------- Responsive (movil): navegacion lista <-> chat ---------- */
 
   @media (max-width: 720px) {
-    #app-screen { flex-direction: column; }
+    #app-screen { flex-direction: column; position: relative; }
+
     .sidebar {
       width: 100%;
       min-width: 0;
-      max-height: 40vh;
+      height: 100%;
       border-right: none;
       border-bottom: 1px solid var(--border);
+      padding-bottom: env(safe-area-inset-bottom);
     }
+
+    .chat-area { position: absolute; inset: 0; }
+
+    /* Por defecto, en movil se ve la lista de contactos/grupos a pantalla
+       completa. Al abrir un chat se añade .chat-active a #app-screen, que
+       oculta la barra lateral y muestra el chat a pantalla completa con un
+       boton de "volver" (en vez de apilar ambos paneles como en escritorio). */
+    #app-screen:not(.chat-active) .chat-area { display: none; }
+    #app-screen.chat-active .sidebar { display: none; }
+
+    #chat-back-btn { display: inline-flex; align-items: center; }
+
+    .chat-header { padding-top: calc(14px + env(safe-area-inset-top)); }
+    #message-form { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
+
     .message { max-width: 85%; }
   }
 </style>
@@ -375,6 +477,12 @@
     </div>
 
     <div class="contacts-header">
+      <span>Grupos</span>
+      <button type="button" id="new-group-btn">+ Nuevo</button>
+    </div>
+    <ul id="group-list"></ul>
+
+    <div class="contacts-header">
       <span>Contactos</span>
       <button type="button" id="refresh-contacts-btn">Actualizar</button>
     </div>
@@ -382,14 +490,18 @@
   </aside>
 
   <main class="chat-area">
-    <div id="chat-empty">Selecciona un contacto a la izquierda para empezar a chatear.</div>
+    <div id="chat-empty">Selecciona un contacto o un grupo a la izquierda para empezar a chatear.</div>
 
     <div id="chat-panel" hidden>
       <div class="chat-header">
-        <div class="contact-name" id="chat-contact-name">—</div>
-        <div class="security-code">
-          <span class="security-label">Codigo de seguridad</span>
-          <span id="chat-security-code">—</span>
+        <button type="button" id="chat-back-btn" aria-label="Volver">&larr;</button>
+        <div class="chat-header-info">
+          <div class="contact-name" id="chat-contact-name">—</div>
+          <div class="security-code" id="chat-security-code-row">
+            <span class="security-label">Codigo de seguridad</span>
+            <span id="chat-security-code">—</span>
+          </div>
+          <div class="group-members" id="chat-group-members" hidden></div>
         </div>
       </div>
 
@@ -401,6 +513,26 @@
       </form>
     </div>
   </main>
+</div>
+
+<!-- ======================= Modal: crear grupo ======================= -->
+<div id="group-modal-overlay" class="modal-overlay" hidden>
+  <div class="modal-card">
+    <h2>Nuevo grupo</h2>
+    <form id="group-form">
+      <label for="group-name">Nombre del grupo</label>
+      <input id="group-name" type="text" maxlength="60" required />
+
+      <label>Miembros</label>
+      <ul id="group-member-list" class="checkbox-list"></ul>
+
+      <div class="modal-actions">
+        <button type="button" id="group-cancel-btn" class="secondary">Cancelar</button>
+        <button type="submit" class="primary">Crear grupo</button>
+      </div>
+      <p class="error-text" id="group-error"></p>
+    </form>
+  </div>
 </div>
 
 <script src="/socket.io/socket.io.js"></script>

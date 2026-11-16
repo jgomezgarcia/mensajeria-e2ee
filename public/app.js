@@ -13,6 +13,10 @@ import {
   encryptMessage,
   decryptMessage,
   computeSecurityCode,
+  generateRawGroupKeyBytes,
+  importGroupKey,
+  wrapGroupKeyForMember,
+  unwrapGroupKey,
 } from './crypto.js';
 
 // ---------------------------------------------------------------------------
@@ -76,8 +80,9 @@ const state = {
   publicKey: null,        // CryptoKey publico propio (para calcular codigo de seguridad)
   socket: null,
   contacts: [],           // [{ username, publicKeyJwk, publicKey }]
-  sharedKeys: new Map(),  // username -> CryptoKey AES-GCM derivada
-  currentContact: null,
+  sharedKeys: new Map(),  // username -> CryptoKey AES-GCM derivada (chats 1 a 1)
+  groups: new Map(),      // groupId -> { id, name, createdBy, members, key: CryptoKey }
+  currentChat: null,      // { type: 'user', id: username } | { type: 'group', id: groupId }
 };
 
 // ---------------------------------------------------------------------------
@@ -107,10 +112,23 @@ const el = {
   contactList: document.getElementById('contact-list'),
   refreshContactsBtn: document.getElementById('refresh-contacts-btn'),
 
+  groupList: document.getElementById('group-list'),
+  newGroupBtn: document.getElementById('new-group-btn'),
+
+  groupModalOverlay: document.getElementById('group-modal-overlay'),
+  groupForm: document.getElementById('group-form'),
+  groupName: document.getElementById('group-name'),
+  groupMemberList: document.getElementById('group-member-list'),
+  groupCancelBtn: document.getElementById('group-cancel-btn'),
+  groupError: document.getElementById('group-error'),
+
   chatEmpty: document.getElementById('chat-empty'),
   chatPanel: document.getElementById('chat-panel'),
+  chatBackBtn: document.getElementById('chat-back-btn'),
   chatContactName: document.getElementById('chat-contact-name'),
+  chatSecurityCodeRow: document.getElementById('chat-security-code-row'),
   chatSecurityCode: document.getElementById('chat-security-code'),
+  chatGroupMembers: document.getElementById('chat-group-members'),
   messageList: document.getElementById('message-list'),
 
   messageForm: document.getElementById('message-form'),
@@ -166,6 +184,7 @@ async function startSessionWithIdentity(record) {
   connectSocket();
   showAppScreen();
   await loadContacts();
+  await loadGroups();
 }
 
 async function tryAutoLogin() {
@@ -282,7 +301,8 @@ el.logoutBtn.addEventListener('click', async () => {
   state.publicKey = null;
   state.contacts = [];
   state.sharedKeys.clear();
-  state.currentContact = null;
+  state.groups.clear();
+  state.currentChat = null;
   showAuthScreen();
 });
 
@@ -302,15 +322,35 @@ function connectSocket() {
     if (message.from !== state.username && message.to !== state.username) return;
 
     const otherParty = message.from === state.username ? message.to : message.from;
-    if (state.currentContact === otherParty) {
+    if (state.currentChat && state.currentChat.type === 'user' && state.currentChat.id === otherParty) {
       const plaintext = await decryptForContact(otherParty, message.ciphertext, message.iv);
       appendMessageToView(message, plaintext);
+    }
+  });
+
+  state.socket.on('group-message', async (message) => {
+    const group = state.groups.get(message.groupId);
+    if (!group) return; // grupo que todavia no hemos cargado localmente
+    if (state.currentChat && state.currentChat.type === 'group' && state.currentChat.id === message.groupId) {
+      const plaintext = await decryptGroupMessage(group, message.ciphertext, message.iv);
+      appendMessageToView(message, plaintext, group);
+    }
+  });
+
+  // Otro miembro nos ha metido en un grupo nuevo: lo desenvolvemos y lo
+  // añadimos a la lista sin necesidad de recargar la pagina.
+  state.socket.on('group-created', async (groupPayload) => {
+    try {
+      await addGroupFromServer(groupPayload);
+      renderGroupList();
+    } catch (err) {
+      console.error('No se pudo incorporar el grupo nuevo:', err);
     }
   });
 }
 
 // ---------------------------------------------------------------------------
-// Contactos y claves compartidas por conversacion
+// Contactos y claves compartidas por conversacion 1 a 1
 // ---------------------------------------------------------------------------
 
 async function loadContacts() {
@@ -335,19 +375,26 @@ function renderContactList() {
     li.className = 'contact-item';
     li.textContent = contact.username;
     li.dataset.username = contact.username;
-    if (contact.username === state.currentContact) li.classList.add('active');
+    if (state.currentChat && state.currentChat.type === 'user' && state.currentChat.id === contact.username) {
+      li.classList.add('active');
+    }
     li.addEventListener('click', () => openChat(contact.username));
     el.contactList.appendChild(li);
   }
+}
+
+async function ensureContactPublicKey(contact) {
+  if (!contact.publicKey) {
+    contact.publicKey = await importPublicKeyJwk(contact.publicKeyJwk);
+  }
+  return contact.publicKey;
 }
 
 async function getSharedKey(username) {
   if (state.sharedKeys.has(username)) return state.sharedKeys.get(username);
   const contact = state.contacts.find((c) => c.username === username);
   if (!contact) throw new Error(`Contacto desconocido: ${username}`);
-  if (!contact.publicKey) {
-    contact.publicKey = await importPublicKeyJwk(contact.publicKeyJwk);
-  }
+  await ensureContactPublicKey(contact);
   const sharedKey = await deriveSharedAesKey(state.privateKey, contact.publicKey);
   state.sharedKeys.set(username, sharedKey);
   return sharedKey;
@@ -364,23 +411,207 @@ async function decryptForContact(username, ciphertext, iv) {
 }
 
 // ---------------------------------------------------------------------------
-// Ventana de chat
+// Grupos: creacion, carga y cifrado/descifrado con la clave simetrica compartida
+// ---------------------------------------------------------------------------
+
+// Clave AES por pares (ECDH) con un miembro concreto, usada SOLO para envolver
+// y desenvolver la clave de grupo (no para cifrar los mensajes del grupo).
+async function getPairwiseKeyWith(username) {
+  if (username === state.username) {
+    // "ECDH con uno mismo": combinacion matematicamente valida de mi privada
+    // con mi propia publica, usada para que yo tambien pueda desenvolver mi
+    // copia de la clave de grupo (por ejemplo tras reimportar la identidad).
+    return deriveSharedAesKey(state.privateKey, state.publicKey);
+  }
+  return getSharedKey(username);
+}
+
+async function loadGroups() {
+  const list = await apiFetch('/api/groups');
+  for (const groupPayload of list) {
+    await addGroupFromServer(groupPayload);
+  }
+  renderGroupList();
+}
+
+async function addGroupFromServer(groupPayload) {
+  if (!groupPayload.wrappedKey) return; // no deberia pasar, pero por si acaso
+  const pairwiseKey = await getPairwiseKeyWith(groupPayload.createdBy);
+  const rawKeyBytes = await unwrapGroupKey(pairwiseKey, groupPayload.wrappedKey);
+  const key = await importGroupKey(rawKeyBytes);
+  state.groups.set(groupPayload.id, {
+    id: groupPayload.id,
+    name: groupPayload.name,
+    createdBy: groupPayload.createdBy,
+    members: groupPayload.members,
+    key,
+  });
+}
+
+function renderGroupList() {
+  el.groupList.innerHTML = '';
+  const groups = Array.from(state.groups.values()).sort((a, b) => a.name.localeCompare(b.name));
+  if (groups.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'contact-empty';
+    empty.textContent = 'Todavia no perteneces a ningun grupo.';
+    el.groupList.appendChild(empty);
+    return;
+  }
+  for (const group of groups) {
+    const li = document.createElement('li');
+    li.className = 'contact-item';
+    li.innerHTML = `<span class="group-badge">#</span>${escapeHtml(group.name)}`;
+    if (state.currentChat && state.currentChat.type === 'group' && state.currentChat.id === group.id) {
+      li.classList.add('active');
+    }
+    li.addEventListener('click', () => openGroup(group.id));
+    el.groupList.appendChild(li);
+  }
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+async function decryptGroupMessage(group, ciphertext, iv) {
+  try {
+    return await decryptMessage(group.key, ciphertext, iv);
+  } catch (err) {
+    console.error('No se pudo descifrar un mensaje de grupo:', err);
+    return '[Mensaje ilegible: no se pudo descifrar]';
+  }
+}
+
+// --- Modal: crear grupo -------------------------------------------------
+
+function openGroupModal() {
+  el.groupError.textContent = '';
+  el.groupName.value = '';
+  el.groupMemberList.innerHTML = '';
+  if (state.contacts.length === 0) {
+    const li = document.createElement('li');
+    li.className = 'checkbox-empty';
+    li.textContent = 'No hay otros usuarios registrados todavia.';
+    el.groupMemberList.appendChild(li);
+  } else {
+    for (const contact of state.contacts) {
+      const li = document.createElement('li');
+      const checkboxId = `group-member-${contact.username}`;
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.id = checkboxId;
+      checkbox.value = contact.username;
+      const label = document.createElement('label');
+      label.htmlFor = checkboxId;
+      label.style.margin = '0';
+      label.textContent = contact.username;
+      li.appendChild(checkbox);
+      li.appendChild(label);
+      el.groupMemberList.appendChild(li);
+    }
+  }
+  el.groupModalOverlay.hidden = false;
+}
+
+function closeGroupModal() {
+  el.groupModalOverlay.hidden = true;
+}
+
+el.newGroupBtn.addEventListener('click', openGroupModal);
+el.groupCancelBtn.addEventListener('click', closeGroupModal);
+el.groupModalOverlay.addEventListener('click', (e) => {
+  if (e.target === el.groupModalOverlay) closeGroupModal();
+});
+
+el.groupForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  el.groupError.textContent = '';
+
+  const name = el.groupName.value.trim();
+  const selected = Array.from(el.groupMemberList.querySelectorAll('input[type="checkbox"]:checked')).map(
+    (cb) => cb.value
+  );
+
+  if (!name) {
+    el.groupError.textContent = 'Ponle un nombre al grupo';
+    return;
+  }
+  if (selected.length === 0) {
+    el.groupError.textContent = 'Selecciona al menos un miembro';
+    return;
+  }
+
+  try {
+    const members = Array.from(new Set([state.username, ...selected]));
+
+    const rawGroupKeyBytes = generateRawGroupKeyBytes();
+    const wrappedKeys = {};
+    for (const member of members) {
+      const pairwiseKey = await getPairwiseKeyWith(member);
+      wrappedKeys[member] = await wrapGroupKeyForMember(pairwiseKey, rawGroupKeyBytes);
+    }
+
+    const result = await apiFetch('/api/groups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, members: selected, wrappedKeys }),
+    });
+
+    const key = await importGroupKey(rawGroupKeyBytes);
+    state.groups.set(result.id, {
+      id: result.id,
+      name: result.name,
+      createdBy: result.createdBy,
+      members: result.members,
+      key,
+    });
+    renderGroupList();
+    closeGroupModal();
+    openGroup(result.id);
+  } catch (err) {
+    el.groupError.textContent = err.message;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Navegacion movil: mostrar la lista o el chat a pantalla completa
+// ---------------------------------------------------------------------------
+
+function showChatView() {
+  el.appScreen.classList.add('chat-active');
+}
+
+function showListView() {
+  el.appScreen.classList.remove('chat-active');
+}
+
+el.chatBackBtn.addEventListener('click', () => {
+  showListView();
+});
+
+// ---------------------------------------------------------------------------
+// Ventana de chat (contacto 1 a 1)
 // ---------------------------------------------------------------------------
 
 async function openChat(username) {
-  state.currentContact = username;
+  state.currentChat = { type: 'user', id: username };
   renderContactList();
+  renderGroupList();
+  showChatView();
 
   el.chatEmpty.hidden = true;
   el.chatPanel.hidden = false;
   el.chatContactName.textContent = username;
   el.messageList.innerHTML = '';
+  el.chatSecurityCodeRow.hidden = false;
+  el.chatGroupMembers.hidden = true;
   el.chatSecurityCode.textContent = 'Calculando codigo de seguridad...';
 
   const contact = state.contacts.find((c) => c.username === username);
-  if (!contact.publicKey) {
-    contact.publicKey = await importPublicKeyJwk(contact.publicKeyJwk);
-  }
+  await ensureContactPublicKey(contact);
   el.chatSecurityCode.textContent = await computeSecurityCode(state.publicKey, contact.publicKey);
 
   const history = await apiFetch(`/api/messages?with=${encodeURIComponent(username)}`);
@@ -390,10 +621,45 @@ async function openChat(username) {
   }
 }
 
-function appendMessageToView(message, plaintext) {
+// ---------------------------------------------------------------------------
+// Ventana de chat (grupo)
+// ---------------------------------------------------------------------------
+
+async function openGroup(groupId) {
+  const group = state.groups.get(groupId);
+  if (!group) return;
+
+  state.currentChat = { type: 'group', id: groupId };
+  renderContactList();
+  renderGroupList();
+  showChatView();
+
+  el.chatEmpty.hidden = true;
+  el.chatPanel.hidden = false;
+  el.chatContactName.textContent = group.name;
+  el.messageList.innerHTML = '';
+  el.chatSecurityCodeRow.hidden = true;
+  el.chatGroupMembers.hidden = false;
+  el.chatGroupMembers.textContent = `Miembros: ${group.members.join(', ')}`;
+
+  const history = await apiFetch(`/api/groups/${encodeURIComponent(groupId)}/messages`);
+  for (const message of history) {
+    const plaintext = await decryptGroupMessage(group, message.ciphertext, message.iv);
+    appendMessageToView(message, plaintext, group);
+  }
+}
+
+function appendMessageToView(message, plaintext, group) {
   const li = document.createElement('li');
   const outgoing = message.from === state.username;
   li.className = `message ${outgoing ? 'outgoing' : 'incoming'}`;
+
+  if (group && !outgoing) {
+    const sender = document.createElement('div');
+    sender.className = 'message-sender';
+    sender.textContent = message.from;
+    li.appendChild(sender);
+  }
 
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
@@ -412,17 +678,28 @@ function appendMessageToView(message, plaintext) {
 el.messageForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = el.messageInput.value.trim();
-  if (!text || !state.currentContact) return;
+  if (!text || !state.currentChat) return;
 
-  const to = state.currentContact;
-  const key = await getSharedKey(to);
-  const { ciphertext, iv } = await encryptMessage(key, text);
-
-  state.socket.emit('message', { to, ciphertext, iv }, (ack) => {
-    if (!ack || !ack.ok) {
-      console.error('No se pudo enviar el mensaje:', ack && ack.error);
-    }
-  });
+  if (state.currentChat.type === 'user') {
+    const to = state.currentChat.id;
+    const key = await getSharedKey(to);
+    const { ciphertext, iv } = await encryptMessage(key, text);
+    state.socket.emit('message', { to, ciphertext, iv }, (ack) => {
+      if (!ack || !ack.ok) {
+        console.error('No se pudo enviar el mensaje:', ack && ack.error);
+      }
+    });
+  } else {
+    const groupId = state.currentChat.id;
+    const group = state.groups.get(groupId);
+    if (!group) return;
+    const { ciphertext, iv } = await encryptMessage(group.key, text);
+    state.socket.emit('group-message', { groupId, ciphertext, iv }, (ack) => {
+      if (!ack || !ack.ok) {
+        console.error('No se pudo enviar el mensaje de grupo:', ack && ack.error);
+      }
+    });
+  }
 
   el.messageInput.value = '';
 });
